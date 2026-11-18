@@ -59,37 +59,46 @@ def placement_grid(cfg, length):
     return grid
 
 
-def probability_density(obs, mask, rng, cfg=GameConfig()):
-    """Fire at the cell the ships still afloat could cover in the most ways.
+TARGET_WEIGHT = 100  # the "heavy" extra weight for each unexplained hit a placement covers
 
-    If there are hits not explained by a sunk ship, only placements through those hits count,
-    weighted by how many of them they cover (target mode).
+
+def sunk_ship_cells(obs, cfg):
+    """Cells that surely belong to sunk ships.
+
+    A sunk ship lies through the cell of its final shot, on hits only, and not on cells already
+    known to belong to another sunk ship. The cells shared by all such positions surely belong
+    to it. Each pass can settle a ship that helps settle another, so we repeat once per ship.
+    """
+    hit = obs[2].ravel() == 1
+    owned = [np.zeros(cfg.num_cells, dtype=bool) for _ in cfg.fleet]  # known cells of each ship
+    for _ in cfg.fleet:
+        for i, length in enumerate(cfg.fleet):
+            final_shot = obs[3 + i].ravel() == 1
+            if final_shot.any():
+                others = np.any([owned[j] for j in range(len(cfg.fleet)) if j != i], axis=0)
+                places = placement_grid(cfg, length)
+                fits = (places & final_shot).any(axis=1) & ~(places & (~hit | others)).any(axis=1)
+                owned[i] = places[fits].all(axis=0)
+    return np.any(owned, axis=0)
+
+
+def probability_density(obs, mask, rng, cfg=GameConfig()):
+    """Fire at the cell the ships still afloat could cover in the most ways (DataGenetics, 2011).
+
+    Misses and sunk ships are obstacles. A placement counts 1, plus TARGET_WEIGHT for every
+    unexplained hit it passes through, so the bot finishes off hit ships before hunting again.
     """
     miss = obs[1].ravel() == 1
-    hit = obs[2].ravel() == 1
-
-    # A sunk ship lies through the cell of its final shot, on hits only. The cells shared by all
-    # such positions surely belong to it (usually there is only one position).
-    sunk = np.zeros(cfg.num_cells, dtype=bool)
-    afloat = []
-    for i, length in enumerate(cfg.fleet):
-        final_shot = obs[3 + i].ravel() == 1
-        if not final_shot.any():
-            afloat.append(length)
-            continue
-        places = placement_grid(cfg, length)
-        possible = places[(places & final_shot).any(axis=1) & ~(places & ~hit).any(axis=1)]
-        sunk |= possible.all(axis=0)
-    open_hits = hit & ~sunk
+    sunk = sunk_ship_cells(obs, cfg)
+    open_hits = (obs[2].ravel() == 1) & ~sunk
 
     density = np.zeros(cfg.num_cells)
-    for length in afloat:
+    for i, length in enumerate(cfg.fleet):
+        if obs[3 + i].any():  # this ship is sunk
+            continue
         places = placement_grid(cfg, length)
         places = places[~(places & (miss | sunk)).any(axis=1)]  # can't cover a miss or a sunk ship
-        if open_hits.any():
-            weight = (places & open_hits).sum(axis=1)  # target mode
-        else:
-            weight = np.ones(len(places))
+        weight = 1 + TARGET_WEIGHT * (places & open_hits).sum(axis=1)
         density += weight @ places
     density[~mask] = -1
     return int(rng.choice(np.flatnonzero(density == density.max())))
